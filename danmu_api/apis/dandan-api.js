@@ -2351,7 +2351,10 @@ async function parseMangoPlayUrl(videoUrl) {
  * 解析优酷播放页 URL
  * 形如: https://v.youku.com/v_show/id_{vid}.html (分集页，vid 常以 == 结尾)
  *      https://www.youku.com/show/id_[z]{showId}.html 或 list.youku.com (专辑页)
- * 分集页的 vid 与 showId 不同，需抓取页面 HTML 提取 showid
+ * 分集页的 vid 与 showId 不同:
+ *   优先走 openapi videos/show.json?ext=show 解析（轻量 JSON，
+ *   且海外 IP 直接抓播放页可能命中版权限制页拿不到 showid，Vercel 部署场景关键），
+ *   失败再回退抓取页面 HTML
  */
 async function parseYoukuPlayUrl(videoUrl) {
   // 优酷对移动端 UA 返回 404 页，需使用桌面 Chrome UA
@@ -2365,6 +2368,7 @@ async function parseYoukuPlayUrl(videoUrl) {
   let showId = showMatch ? showMatch[1] : null;
   let currentVid = null;
   let pageTitle = null;
+  let openApiInfo = null;
 
   if (!showId) {
     // 分集页: 提取 vid (兼容 %3D 编码的 == 后缀)
@@ -2375,14 +2379,34 @@ async function parseYoukuPlayUrl(videoUrl) {
     if (!vMatch) return null;
     currentVid = vMatch[1];
 
-    // 抓取播放页 HTML，一次拿到 showid 和页面标题
-    const response = await httpGet(`https://v.youku.com/v_show/id_${currentVid}.html`, { headers: desktopHeaders });
-    const html = typeof response?.data === "string" ? response.data : "";
-    const idMatch = html.match(/"showid"\s*:\s*"([a-f0-9]{20,24})"/i) || html.match(/"showId"\s*:\s*"([a-f0-9]{20,24})"/i);
-    showId = idMatch ? idMatch[1] : null;
-    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-    pageTitle = titleMatch ? titleMatch[1] : null;
-    if (!showId) return null;
+    // 优先走 openapi: vid → show（返回 showId、剧名、品类、当前集序号）
+    try {
+      const apiUrl = `https://openapi.youku.com/v2/videos/show.json?client_id=53e6cc67237fc59a&video_id=${encodeURIComponent(currentVid)}&package=com.huawei.hwvplayer.youku&ext=show`;
+      const res = await httpGet(apiUrl, {
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36'
+        }
+      });
+      const data = typeof res?.data === "string" ? JSON.parse(res.data) : res?.data;
+      if (data && data.show && data.show.id) {
+        showId = String(data.show.id).replace(/^z/, '');
+        openApiInfo = { showName: data.show.name || null, category: data.category || null, seq: data.show.seq || null };
+      }
+    } catch (e) {
+      log("info", "[system] [parse] 优酷 openapi 解析失败，回退页面抓取:", e.message);
+    }
+
+    // openapi 未覆盖（如老内容缺 show 字段）时回退抓取播放页 HTML
+    if (!showId) {
+      const response = await httpGet(`https://v.youku.com/v_show/id_${currentVid}.html`, { headers: desktopHeaders });
+      const html = typeof response?.data === "string" ? response.data : "";
+      const idMatch = html.match(/"showid"\s*:\s*"([a-f0-9]{20,24})"/i) || html.match(/"showId"\s*:\s*"([a-f0-9]{20,24})"/i);
+      showId = idMatch ? idMatch[1] : null;
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+      pageTitle = titleMatch ? titleMatch[1] : null;
+      if (!showId) return null;
+    }
   } else {
     // 专辑页: 抓取页面获取标题（show 页会重定向到首集播放页）
     try {
@@ -2396,8 +2420,8 @@ async function parseYoukuPlayUrl(videoUrl) {
   }
 
   const eps = await sourceLogContext.run(getLogNameByKey('youku'), () => youkuSource.getEpisodes(showId));
-  // 从页面标题的品类后缀（如 "-电视剧-高清完整正版..."）推断媒体类型，影响分集标题格式化
-  const mediaType = youkuSource._extractMediaType('', pageTitle || '');
+  // 媒体类型影响分集标题格式化: openapi 的 category 优先，回退到页面标题的品类后缀（如 "-电视剧-高清完整正版..."）
+  const mediaType = youkuSource._extractMediaType(openApiInfo?.category || '', pageTitle || '');
   const formatted = youkuSource._processAndFormatEpisodes(eps || [], mediaType);
   const episodes = formatted.map((ep, i) => ({
     episodeNumber: ep.episodeIndex || i + 1,
@@ -2406,9 +2430,13 @@ async function parseYoukuPlayUrl(videoUrl) {
     url: (ep.link || `https://v.youku.com/v_show/id_${ep.vid}.html`).replace(/^http:/, 'https:')
   }));
 
-  // 优酷标题以 "-" 分隔品类/平台后缀，先取首段再复用通用清洗
+  // 标题: openapi show.name（干净剧名）→ 页面标题首段（优酷以 "-" 分隔品类/平台后缀）→ 交由上层推导
   let animeTitle = null;
-  if (pageTitle) {
+  if (openApiInfo && openApiInfo.showName) {
+    const cleaned = cleanPageTitleForParse(openApiInfo.showName);
+    if (cleaned && !isGenericPlatformTitle(cleaned)) animeTitle = cleaned;
+  }
+  if (!animeTitle && pageTitle) {
     const firstSeg = pageTitle.split('-')[0];
     const cleaned = cleanPageTitleForParse(firstSeg);
     if (cleaned && !isGenericPlatformTitle(cleaned)) animeTitle = cleaned;
@@ -2493,7 +2521,8 @@ export async function parseVideoUrl(url) {
       return jsonResponse({ errorCode: 400, success: false, errorMessage: "Missing url parameter" }, 400);
     }
 
-    let videoUrl = rawUrl.trim();
+    // 清理复制粘贴常带入的包裹引号/反引号与结尾标点（如句号）
+    let videoUrl = rawUrl.trim().replace(/^["'`「【]+/, "").replace(/["'`」】]+$/, "").replace(/[.,，。;；]+$/, "").trim();
     if (!videoUrl.startsWith("http")) {
       return jsonResponse({ errorCode: 400, success: false, errorMessage: "Invalid url, must start with http/https" }, 400);
     }
@@ -2523,18 +2552,27 @@ export async function parseVideoUrl(url) {
     const selfTitled = platform === "youku" || (platform === "bilibili" && /\/bangumi\/play\/ep\d+/.test(videoUrl));
     const pageTitlePromise = (!selfTitled && platform) ? getPageTitle(videoUrl).catch(() => null) : null;
 
-    let parsed = null;
-    if (platform === "tencent") parsed = await parseTencentPlayUrl(videoUrl);
-    else if (platform === "iqiyi") parsed = await parseIqiyiPlayUrl(videoUrl);
-    else if (platform === "imgo") parsed = await parseMangoPlayUrl(videoUrl);
-    else if (platform === "youku") parsed = await parseYoukuPlayUrl(videoUrl);
-    else if (platform === "bilibili") parsed = await parseBilibiliPlayUrl(videoUrl);
-
+    // 各平台解析器分发表
+    const parseHandlers = {
+      tencent: parseTencentPlayUrl,
+      iqiyi: parseIqiyiPlayUrl,
+      imgo: parseMangoPlayUrl,
+      youku: parseYoukuPlayUrl,
+      bilibili: parseBilibiliPlayUrl
+    };
+    if (!platform || !parseHandlers[platform]) {
+      return jsonResponse({
+        errorCode: 400,
+        success: false,
+        errorMessage: `Unsupported url: ${videoUrl}. Supported platforms: v.qq.com / iqiyi.com / mgtv.com / youku.com / bilibili.com`
+      }, 400);
+    }
+    let parsed = await parseHandlers[platform](videoUrl);
     if (!parsed) {
       return jsonResponse({
         errorCode: 400,
         success: false,
-        errorMessage: `Unsupported url or unrecognized play page: ${videoUrl}. Supported platforms: v.qq.com / iqiyi.com / mgtv.com / youku.com / bilibili.com`
+        errorMessage: `无法解析该播放页: ${videoUrl}（视频可能不存在、仅限会员或受地区版权限制）`
       }, 400);
     }
 

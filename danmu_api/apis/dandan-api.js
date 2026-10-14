@@ -2137,7 +2137,8 @@ export async function searchEpisodes(url) {
   let resultAnimes = [];
 
   // 遍历所有找到的动漫，获取它们的集数信息
-  for (const animeItem of searchData.animes) {
+  // 多个结果并发获取详情（原为串行逐个 await，结果越多提速越明显），结果顺序保持与搜索一致
+  const detailResults = await Promise.all(searchData.animes.map(async (animeItem) => {
     const detailAnime =
       resolveAnimeById(animeItem.bangumiId, requestAnimeDetailsMap, animeItem.source) ||
       resolveAnimeById(animeItem.animeId, requestAnimeDetailsMap, animeItem.source);
@@ -2150,7 +2151,10 @@ export async function searchEpisodes(url) {
       const bangumiRes = await getBangumi(bangumiUrl.pathname);
       bangumiData = await bangumiRes.json();
     }
+    return { animeItem, bangumiData };
+  }));
 
+  for (const { animeItem, bangumiData } of detailResults) {
     if (bangumiData.success && bangumiData.bangumi && bangumiData.bangumi.episodes) {
       let filteredEpisodes = bangumiData.bangumi.episodes;
 

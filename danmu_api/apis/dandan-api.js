@@ -2247,9 +2247,39 @@ function deriveTitleFromEpisodeTitle(epTitle) {
   const lead = title.match(/^(.+?)第\s*\d+\s*[集话期回]/);
   if (lead && lead[1].trim()) return lead[1].trim();
   // 结尾是 "_01" / " 01" / "-01" 等集数标记
-  const tail = title.replace(/[\s_\-·]+(第?\d{1,4}|预告|正片|花絮|加更版?)$/i, "");
-  if (tail.trim()) title = tail.trim();
-  return title;
+  const stripped = title.replace(/[\s_\-·]+(第?\d{1,4}|预告|正片|花絮|加更版?)$/i, "");
+  let result = stripped.trim() && stripped !== title ? stripped.trim() : "";
+  // 推导结果仍是 "第N集..." 开头（如综艺分集标题），说明未剥离出剧名
+  if (result && /^第\s*\d+\s*[集话期回]/.test(result)) result = "";
+  return result;
+}
+
+/**
+ * /api/v2/parse/url 结果缓存
+ * 解析需请求平台接口（Vercel 等境外函数访问国内平台单次可达数秒），
+ * 缓存命中可将重复请求降至毫秒级
+ */
+const PARSE_URL_CACHE_TTL_MS = 60 * 60 * 1000; // 1 小时
+const PARSE_URL_CACHE_MAX = 200;
+const parseUrlCache = new Map();
+
+function getParseUrlCache(key) {
+  const entry = parseUrlCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.time > PARSE_URL_CACHE_TTL_MS) {
+    parseUrlCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setParseUrlCache(key, data) {
+  // 超出上限时淘汰最早写入的条目
+  if (parseUrlCache.size >= PARSE_URL_CACHE_MAX) {
+    const firstKey = parseUrlCache.keys().next().value;
+    parseUrlCache.delete(firstKey);
+  }
+  parseUrlCache.set(key, { time: Date.now(), data });
 }
 
 /**
@@ -2476,6 +2506,19 @@ export async function parseVideoUrl(url) {
     }
 
     const platform = detectPlatformFromUrl(videoUrl);
+
+    // 命中缓存直接返回（重复请求毫秒级响应）
+    const cached = getParseUrlCache(videoUrl);
+    if (cached) {
+      log("info", `[system] [parse] 命中缓存: ${videoUrl}`);
+      return jsonResponse(cached);
+    }
+
+    // 优酷分集页与B站ep页会自带标题；其余平台并行预取网页标题作兜底，
+    // 与分集请求同时发起，避免拿到分集后再串行抓取页面（可省 1-3 秒）
+    const selfTitled = platform === "youku" || (platform === "bilibili" && /\/bangumi\/play\/ep\d+/.test(videoUrl));
+    const pageTitlePromise = (!selfTitled && platform) ? getPageTitle(videoUrl).catch(() => null) : null;
+
     let parsed = null;
     if (platform === "tencent") parsed = await parseTencentPlayUrl(videoUrl);
     else if (platform === "iqiyi") parsed = await parseIqiyiPlayUrl(videoUrl);
@@ -2511,26 +2554,26 @@ export async function parseVideoUrl(url) {
       currentEpisode = parsed.episodes[parsed.currentEpisodeNumber - 1];
     }
 
-    // 标题: 平台API提供 → 网页标题清洗(排除平台泛化名) → 首集标题推导 → 首集标题兜底
+    // 标题解析顺序（兼顾速度与质量）:
+    // 1. 平台API自带标题（零开销）
+    // 2. 首集标题推导（零网络开销，"庆余年_02" → "庆余年"，多数剧集可在此解决）
+    // 3. 并行预取的网页标题清洗（综艺等推导失败时才等待）
+    // 4. 首集标题原样兜底
     let animeTitle = parsed.animeTitle || null;
-    if (!animeTitle) {
-      try {
-        const pageTitle = await getPageTitle(videoUrl);
-        const cleaned = cleanPageTitleForParse(pageTitle);
-        if (cleaned && !isGenericPlatformTitle(cleaned)) animeTitle = cleaned;
-      } catch (e) {
-        log("info", "[system] [parse] 获取页面标题失败:", e.message);
-      }
-    }
     if (!animeTitle) {
       const derived = deriveTitleFromEpisodeTitle(parsed.episodes[0].episodeTitle);
       if (derived && !isGenericPlatformTitle(derived)) animeTitle = derived;
+    }
+    if (!animeTitle && pageTitlePromise) {
+      const pageTitle = await pageTitlePromise;
+      const cleaned = cleanPageTitleForParse(pageTitle);
+      if (cleaned && !isGenericPlatformTitle(cleaned)) animeTitle = cleaned;
     }
     if (!animeTitle) animeTitle = parsed.episodes[0].episodeTitle || "未知标题";
 
     log("info", `[system] [parse] 解析播放页成功: source=${parsed.source}, title=${animeTitle}, episodes=${parsed.episodes.length}`);
 
-    return jsonResponse({
+    const responseData = {
       errorCode: 0,
       success: true,
       errorMessage: "",
@@ -2541,7 +2584,12 @@ export async function parseVideoUrl(url) {
       currentEpisodeNumber: currentEpisode ? currentEpisode.episodeNumber : null,
       currentEpisode,
       episodes: parsed.episodes
-    });
+    };
+
+    // 写入缓存，重复请求直接命中
+    setParseUrlCache(videoUrl, responseData);
+
+    return jsonResponse(responseData);
   } catch (error) {
     log("error", "[system] [parse] 解析播放页出错:", error.message);
     return jsonResponse({ errorCode: 500, success: false, errorMessage: `Failed to parse url: ${error.message}` }, 500);

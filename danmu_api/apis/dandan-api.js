@@ -2235,6 +2235,8 @@ function cleanPageTitleForParse(pageTitle) {
 function isGenericPlatformTitle(title) {
   if (!title) return true;
   const t = title.trim();
+  // getPageTitle 提取失败时返回原始 URL，URL 不是有效标题
+  if (/^https?:\/\//i.test(t)) return true;
   if (/^(腾讯视频|爱奇艺|芒果\s*TV|哔哩哔哩|bilibili|优酷|搜狐视频|咪咕视频|乐视视频|西瓜视频)$/i.test(t)) return true;
   // 平台 404 页标题 (如 "优酷404")
   return /404|页面不存在|not\s*found|访问出错/i.test(t);
@@ -2320,8 +2322,10 @@ async function parseIqiyiPlayUrl(videoUrl) {
     episodeId: ep.id,
     url: ep.link || `https://www.iqiyi.com/v_${ep.id}.html`
   }));
+  // 电影页: 单个正片分集且标题即片名，直接作为剧名（避免网页标题清洗不净污染匹配）
+  const animeTitle = (eps && eps.length === 1 && eps[0].isMovie) ? episodes[0].episodeTitle : null;
   // 爱奇艺分集的 id 是 tvid，与 URL 中的 vid 不同，需通过 link 匹配当前集
-  return { source: 'iqiyi', episodes, currentEpisodeLink: vMatch ? `v_${vMatch[1]}.html` : null };
+  return { source: 'iqiyi', animeTitle, episodes, currentEpisodeLink: vMatch ? `v_${vMatch[1]}.html` : null };
 }
 
 /**

@@ -332,12 +332,34 @@ export default class IqiyiSource extends BaseSource {
 
       const blocks = tabs[0].blocks || [];
       let foundEpisodes = false;
+      // 电影正片数据：电影页没有 episodes 分集块，正片在 film_feature_bk 中，结构也不同
+      // （data.data 为 {videos: [...]} 对象而非数组）；仅在未找到剧集分集块时作为回退返回
+      const movieEpisodes = [];
       const fetchedSeasons = seasonAlbumCache || new Map();
 
       for (const block of blocks) {
         // 查找 video_list 类型的块（新版API）
         if (block.bk_type === "video_list" && block.data?.data) {
           log("info", `[iqiyi] 找到 video_list 类型的分集数据块, bk_id: ${block.bk_id}`);
+
+          // 电影正片块：提取正片 tvid 与播放页链接
+          if (block.bk_id === "film_feature_bk" && !Array.isArray(block.data.data) && Array.isArray(block.data.data.videos)) {
+            for (const video of block.data.data.videos) {
+              const tvidMatch = (video.play_url || "").match(/tvid=(\d+)/);
+              if (!tvidMatch || !video.page_url) continue;
+              // 标题形如 "正片｜老江湖"，去掉 "正片｜" 前缀便于上层从首集标题推导剧名
+              const title = (video.title || "正片").replace(/^正片[｜|]\s*/, "") || "正片";
+              movieEpisodes.push({
+                id: tvidMatch[1],
+                title: title,
+                order: movieEpisodes.length + 1,
+                link: video.page_url,
+                isMovie: true
+              });
+            }
+            log("info", `[iqiyi] 电影正片块，提取到 ${movieEpisodes.length} 个正片`);
+            continue;
+          }
 
           // 检查是否是分集选择器块
           if (!block.tag || !block.tag.includes("episodes")) {
@@ -473,6 +495,11 @@ export default class IqiyiSource extends BaseSource {
       }
 
       if (!foundEpisodes) {
+        // 电影页：无 episodes 分集块时回退返回正片（与芒果 _getMovieEpisode 同思路）
+        if (movieEpisodes.length > 0) {
+          log("info", `[iqiyi] 未找到剧集分集块，按电影正片返回 ${movieEpisodes.length} 个`);
+          return movieEpisodes;
+        }
         log("info", "[iqiyi] 未找到分集数据块");
         return [];
       }

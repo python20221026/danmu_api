@@ -558,10 +558,14 @@ export async function httpDelete(url, options = {}) {
 
 export async function getPageTitle(url) {
   try {
+    // 芒果TV 对移动 UA 只返回无 title 的 JS 壳页，需用桌面 UA 获取 SSR 页面标题
+    const isMgtv = /mgtv\.com/i.test(url);
     // 使用 httpGet 获取网页内容
     const response = await httpGet(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'
+        'User-Agent': isMgtv
+          ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          : 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'
       }
     });
 

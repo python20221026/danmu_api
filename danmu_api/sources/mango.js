@@ -116,7 +116,8 @@ export default class MangoSource extends BaseSource {
       // 处理搜索结果
       const results = [];
       for (const content of data.data.contents) {
-        if (content.type !== "mediaRebirthV2") {
+        // 媒体结果已迁移至 mediaRebirthV3（V2 已下线），旧名保留兼容
+        if (content.type !== "mediaRebirthV2" && content.type !== "mediaRebirthV3") {
           continue;
         }
 

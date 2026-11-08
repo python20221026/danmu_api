@@ -2261,6 +2261,27 @@ function deriveTitleFromEpisodeTitle(epTitle) {
 }
 
 /**
+ * 将各平台的类型标识（中文类型名 / 优酷英文码）标准化为
+ * 电影/电视剧/动漫/综艺/纪录片，无法识别时返回 null
+ */
+function normalizeMediaType(raw) {
+  if (!raw) return null;
+  const t = String(raw).toLowerCase();
+  // 优酷英文码 variety/movie/anime/drama
+  if (t.includes("variety")) return "综艺";
+  if (t.includes("movie")) return "电影";
+  if (t.includes("anime")) return "动漫";
+  if (t.includes("drama")) return "电视剧";
+  // 中文类型名（腾讯可能带 2D/3D 前缀，如 "3D动漫"）
+  if (t.includes("纪录片")) return "纪录片";
+  if (t.includes("电影")) return "电影";
+  if (t.includes("动漫") || t.includes("动画") || t.includes("番剧") || t.includes("国创")) return "动漫";
+  if (t.includes("综艺") || t.includes("真人秀")) return "综艺";
+  if (t.includes("电视剧") || t.includes("剧集")) return "电视剧";
+  return null;
+}
+
+/**
  * /api/v2/parse/url 结果缓存
  * 解析需请求平台接口（Vercel 等境外函数访问国内平台单次可达数秒），
  * 缓存命中可将重复请求降至毫秒级
@@ -2296,6 +2317,22 @@ async function parseTencentPlayUrl(videoUrl) {
   const match = videoUrl.match(/\/x\/cover\/([a-zA-Z0-9]+)(?:\/([a-zA-Z0-9]+)\.html?)?/);
   if (!match) return null;
   const [, cid, vid] = match;
+  // 分集接口无类型字段，并行抓取移动端专辑页 __PINIA__ 中的 type_name（与分集请求同时发起）
+  const typePromise = (async () => {
+    try {
+      const response = await httpGet(`https://m.v.qq.com/cover/m/${cid}.html`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+        }
+      });
+      const html = typeof response?.data === "string" ? response.data : "";
+      const typeMatch = html.match(/"type_name"\s*:\s*"([^"]+)"/);
+      return typeMatch ? normalizeMediaType(typeMatch[1]) : null;
+    } catch (e) {
+      log("info", "[system] [parse] 获取腾讯专辑类型失败:", e.message);
+      return null;
+    }
+  })();
   const eps = await sourceLogContext.run(getLogNameByKey('tencent'), () => tencentSource.getEpisodes(cid));
   const episodes = (eps || []).map((ep, i) => ({
     episodeNumber: i + 1,
@@ -2303,8 +2340,12 @@ async function parseTencentPlayUrl(videoUrl) {
     episodeId: ep.vid,
     url: `https://v.qq.com/x/cover/${cid}/${ep.vid}.html`
   }));
-  return { source: 'tencent', episodes, currentEpisodeId: vid || null };
+  const mediaType = await typePromise;
+  return { source: 'tencent', mediaType, episodes, currentEpisodeId: vid || null };
 }
+
+// 爱奇艺 base_info 的 channel_id → 媒体类型（已实测验证）
+const IQIYI_CHANNEL_TYPE_MAP = { 1: "电影", 2: "电视剧", 3: "纪录片", 4: "动漫", 6: "综艺" };
 
 /**
  * 解析爱奇艺播放页 URL
@@ -2315,7 +2356,11 @@ async function parseIqiyiPlayUrl(videoUrl) {
   const aMatch = videoUrl.match(/iqiyi\.com\/a_([a-zA-Z0-9]+)\.html/);
   if (!vMatch && !aMatch) return null;
   const mediaId = vMatch ? vMatch[1] : aMatch[1];
-  const eps = await sourceLogContext.run(getLogNameByKey('iqiyi'), () => iqiyiSource.getEpisodes(mediaId));
+  // baseInfoCache 复用 getEpisodes 内部的 base_info 响应，避免为取类型额外请求一次
+  const baseInfoCache = new Map();
+  const eps = await sourceLogContext.run(getLogNameByKey('iqiyi'), () => iqiyiSource.getEpisodes(mediaId, null, null, null, baseInfoCache));
+  const channelId = baseInfoCache.get(mediaId)?.data?.base_data?.channel_id;
+  const mediaType = IQIYI_CHANNEL_TYPE_MAP[channelId] || null;
   const episodes = (eps || []).map((ep, i) => ({
     episodeNumber: ep.order || i + 1,
     episodeTitle: ep.title || `第${ep.order || i + 1}集`,
@@ -2325,7 +2370,7 @@ async function parseIqiyiPlayUrl(videoUrl) {
   // 电影页: 单个正片分集且标题即片名，直接作为剧名（避免网页标题清洗不净污染匹配）
   const animeTitle = (eps && eps.length === 1 && eps[0].isMovie) ? episodes[0].episodeTitle : null;
   // 爱奇艺分集的 id 是 tvid，与 URL 中的 vid 不同，需通过 link 匹配当前集
-  return { source: 'iqiyi', animeTitle, episodes, currentEpisodeLink: vMatch ? `v_${vMatch[1]}.html` : null };
+  return { source: 'iqiyi', mediaType, animeTitle, episodes, currentEpisodeLink: vMatch ? `v_${vMatch[1]}.html` : null };
 }
 
 /**
@@ -2336,11 +2381,36 @@ async function parseMangoPlayUrl(videoUrl) {
   const match = videoUrl.match(/mgtv\.com\/b\/(\d+)(?:\/(\d+)\.html?)?/);
   if (!match) return null;
   const [, collectionId, clipId] = match;
+  // video/info 接口的 fstlvlType 为中文一级类型（如"综艺"）；有 clipId 时与分集请求并行
+  const fetchTypeByVid = async (vid) => {
+    try {
+      const response = await httpGet(`https://pcweb.api.mgtv.com/video/info?cid=${collectionId}&vid=${vid}`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://www.mgtv.com/'
+        }
+      });
+      const data = typeof response?.data === "string" ? JSON.parse(response.data) : response?.data;
+      return normalizeMediaType(data?.data?.info?.fstlvlType);
+    } catch (e) {
+      log("info", "[system] [parse] 获取芒果TV类型失败:", e.message);
+      return null;
+    }
+  };
+  let typePromise = clipId ? fetchTypeByVid(clipId) : null;
   let eps = await sourceLogContext.run(getLogNameByKey('imgo'), () => mangoSource.getEpisodes(collectionId));
   // 电影类型 getEpisodes 可能为空，回退到电影正片接口
   if (!eps || eps.length === 0) {
     const movieEpisode = await sourceLogContext.run(getLogNameByKey('imgo'), () => mangoSource._getMovieEpisode(collectionId));
     eps = movieEpisode ? [movieEpisode] : [];
+  }
+  let mediaType = null;
+  if (typePromise) {
+    // URL 中的 clipId 可能已失效，失败时用分集列表首个 vid 重试
+    mediaType = await typePromise;
+  }
+  if (!mediaType && eps.length > 0) {
+    mediaType = await fetchTypeByVid(eps[0].video_id);
   }
   const episodes = (eps || []).map((ep, i) => ({
     episodeNumber: i + 1,
@@ -2348,7 +2418,7 @@ async function parseMangoPlayUrl(videoUrl) {
     episodeId: ep.video_id,
     url: `https://www.mgtv.com/b/${collectionId}/${ep.video_id}.html`
   }));
-  return { source: 'imgo', episodes, currentEpisodeId: clipId || null };
+  return { source: 'imgo', mediaType, episodes, currentEpisodeId: clipId || null };
 }
 
 /**
@@ -2426,6 +2496,8 @@ async function parseYoukuPlayUrl(videoUrl) {
   const eps = await sourceLogContext.run(getLogNameByKey('youku'), () => youkuSource.getEpisodes(showId));
   // 媒体类型影响分集标题格式化: openapi 的 category 优先，回退到页面标题的品类后缀（如 "-电视剧-高清完整正版..."）
   const mediaType = youkuSource._extractMediaType(openApiInfo?.category || '', pageTitle || '');
+  // 分集自带的 category 为中文类型名（如"电视剧"），比 openapi/category 推导更可靠
+  const normalizedType = normalizeMediaType(eps && eps[0] && eps[0].category) || normalizeMediaType(mediaType);
   const formatted = youkuSource._processAndFormatEpisodes(eps || [], mediaType);
   const episodes = formatted.map((ep, i) => ({
     episodeNumber: ep.episodeIndex || i + 1,
@@ -2445,8 +2517,11 @@ async function parseYoukuPlayUrl(videoUrl) {
     const cleaned = cleanPageTitleForParse(firstSeg);
     if (cleaned && !isGenericPlatformTitle(cleaned)) animeTitle = cleaned;
   }
-  return { source: 'youku', animeTitle, episodes, currentEpisodeId: currentVid };
+  return { source: 'youku', mediaType: normalizedType, animeTitle, episodes, currentEpisodeId: currentVid };
 }
+
+// 哔哩哔哩 season API 的 type 码 → 媒体类型（已实测验证）
+const BILIBILI_SEASON_TYPE_MAP = { 1: "动漫", 2: "电影", 3: "纪录片", 4: "动漫", 5: "电视剧", 7: "综艺" };
 
 /**
  * 解析哔哩哔哩播放页 URL
@@ -2478,6 +2553,7 @@ async function parseBilibiliPlayUrl(videoUrl) {
       }));
       return {
         source: 'bilibili',
+        mediaType: BILIBILI_SEASON_TYPE_MAP[data.result.type] || null,
         animeTitle: data.result.media_title || data.result.title || null,
         episodes,
         currentEpisodeId: epMatch[1]
@@ -2489,13 +2565,15 @@ async function parseBilibiliPlayUrl(videoUrl) {
   if (ssMatch || mdMatch) {
     const sourceId = ssMatch ? `ss${ssMatch[1]}` : `md${mdMatch[1]}`;
     const eps = await sourceLogContext.run(getLogNameByKey('bilibili'), () => bilibiliSource.getEpisodes(sourceId));
+    // _getPgcEpisodes 会在分集数组上挂载 _biliType（season API 的 type 码）
+    const mediaType = BILIBILI_SEASON_TYPE_MAP[eps?._biliType] || null;
     const episodes = (eps || []).map((ep, i) => ({
       episodeNumber: i + 1,
       episodeTitle: ep.title || `第${i + 1}话`,
       episodeId: String(ep.id),
       url: ep.link
     }));
-    return { source: 'bilibili', episodes, currentEpisodeId: null };
+    return { source: 'bilibili', mediaType, episodes, currentEpisodeId: null };
   }
 
   if (bvMatch) {
@@ -2617,7 +2695,7 @@ export async function parseVideoUrl(url) {
     }
     if (!animeTitle) animeTitle = parsed.episodes[0].episodeTitle || "未知标题";
 
-    log("info", `[system] [parse] 解析播放页成功: source=${parsed.source}, title=${animeTitle}, episodes=${parsed.episodes.length}`);
+    log("info", `[system] [parse] 解析播放页成功: source=${parsed.source}, title=${animeTitle}, type=${parsed.mediaType || '未知'}, episodes=${parsed.episodes.length}`);
 
     const responseData = {
       errorCode: 0,
@@ -2625,6 +2703,7 @@ export async function parseVideoUrl(url) {
       errorMessage: "",
       source: parsed.source,
       animeTitle,
+      type: parsed.mediaType || null,
       totalEpisodes: parsed.episodes.length,
       isEpisodePage: !!currentEpisode,
       currentEpisodeNumber: currentEpisode ? currentEpisode.episodeNumber : null,

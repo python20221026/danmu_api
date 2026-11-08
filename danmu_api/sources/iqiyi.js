@@ -316,6 +316,8 @@ export default class IqiyiSource extends BaseSource {
         data = baseInfoCache.get(id);
       } else {
         data = await this._fetchBaseInfoData(entityId);
+        // 写回缓存，供调用方读取 base_data（如媒体类型 channel_id）
+        if (data && baseInfoCache) baseInfoCache.set(id, data);
       }
       if (!data || data.status_code !== 0 || !data.data || !data.data.template) {
         return [];

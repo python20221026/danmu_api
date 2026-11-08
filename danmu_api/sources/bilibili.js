@@ -475,6 +475,8 @@ export default class BilibiliSource extends BaseSource {
                 rawEpisodes = data.result.main_section?.episodes || data.result.episodes || [];
                 // 从详情接口提取番剧主封面，供搜索结果未提供 imageUrl 时使用
                 if (data.result.cover) rawEpisodes._cover = data.result.cover;
+                // 挂载媒体类型码（1/4=动漫 2=电影 3=纪录片 5=电视剧 7=综艺），供上层映射
+                if (data.result.type) rawEpisodes._biliType = data.result.type;
                 if (rawEpisodes.length > 0) break;
             }
         } catch(e) {
@@ -511,6 +513,8 @@ export default class BilibiliSource extends BaseSource {
 
     // 将详情接口封面转移到返回数组（.map() 产生新数组，不会继承原数组属性）
     if (rawEpisodes._cover) episodes._cover = rawEpisodes._cover;
+    // 转移媒体类型码，同上
+    if (rawEpisodes._biliType) episodes._biliType = rawEpisodes._biliType;
 
     log("info", `[bilibili] 获取到 ${episodes.length} 个番剧分集`);
     return episodes;
